@@ -111,6 +111,36 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                     result = geyser_client.subscribe_with_request(Some(subscribe_request.clone())) => {
                         match result {
                             Ok((mut subscribe_tx, mut stream)) => {
+                                // 将ping机制移至单独的异步任务中
+                                let ping_tx = subscribe_tx.clone();
+                                let ping_cancellation = cancellation_token.clone();
+                                
+                                tokio::spawn(async move {
+                                    let mut timer = interval(AsyncDuration::from_mins(5));
+                                    let mut id = 0;
+                                    
+                                    loop {
+                                        tokio::select! {
+                                            // _ = ping_cancellation.cancelled() => {
+                                            //     log::info!("Cancelling Yellowstone gRPC ping task.");
+                                            //     break;
+                                            // }
+                                            _ = timer.tick() => {
+                                                id += 1;
+                                                if let Err(e) = ping_tx
+                                                    .send(SubscribeRequest {
+                                                        ping: Some(SubscribeRequestPing { id }),
+                                                        ..Default::default()
+                                                    })
+                                                    .await {
+                                                    log::error!("Failed to send ping: {:?}", e);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
+
                                 while let Some(message) = stream.next().await {
                                     match message {
                                         Ok(msg) => match msg.update_oneof {
