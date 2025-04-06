@@ -112,193 +112,206 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                     result = geyser_client.subscribe_with_request(Some(subscribe_request.clone())) => {
                         match result {
                             Ok((mut subscribe_tx, mut stream)) => {
-                                // 将ping机制移至单独的异步任务中
-                                let ping_tx = subscribe_tx.clone();
-                                let ping_cancellation = cancellation_token.clone();
-                                
-                                tokio::spawn(async move {
-                                    let mut timer = interval(AsyncDuration::from_mins(5));
-                                    let mut id = 0;
-                                    
+                                let (ping_sender, mut ping_receiver) = tokio::sync::mpsc::channel(10);
+
+                                let ping_handle = tokio::spawn(async move {
+                                    let mut interval = tokio::time::interval(Duration::from_secs(30));
                                     loop {
-                                        tokio::select! {
-                                            // _ = ping_cancellation.cancelled() => {
-                                            //     log::info!("Cancelling Yellowstone gRPC ping task.");
-                                            //     break;
-                                            // }
-                                            _ = timer.tick() => {
-                                                id += 1;
-                                                if let Err(e) = ping_tx
-                                                    .send(SubscribeRequest {
-                                                        ping: Some(SubscribeRequestPing { id }),
-                                                        ..Default::default()
-                                                    })
-                                                    .await {
-                                                    log::error!("Failed to send ping: {:?}", e);
-                                                    break;
-                                                }
-                                            }
+                                        interval.tick().await;
+                                        if let Err(e) = ping_sender.send(()).await {
+                                            log::error!("Failed to send ping signal: {:?}", e);
+                                            break;
                                         }
                                     }
                                 });
 
-                                while let Some(message) = stream.next().await {
-                                    match message {
-                                        Ok(msg) => match msg.update_oneof {
-                                            Some(UpdateOneof::Account(account_update)) => {
-                                                let start_time = std::time::Instant::now();
+                                let mut ping_stream_active = true;
 
-                                                metrics.increment_counter("yellowstone_grpc_account_updates_received", 1).await.unwrap();
+                                // add ping process
+                                while ping_stream_active {
+                                    tokio::select! {
+                                        message = stream.next() => {
+                                            match message {
+                                                Some(Ok(msg)) => {
+                                                    match msg.update_oneof {
+                                                        Some(UpdateOneof::Account(account_update)) => {
+                                                            let start_time = std::time::Instant::now();
 
+                                                            metrics.increment_counter("yellowstone_grpc_account_updates_received", 1).await.unwrap();
 
-                                                if let Some(account_info) = account_update.account {
-                                                    let Ok(account_pubkey) =
-                                                        Pubkey::try_from(account_info.pubkey)
-                                                    else {
-                                                        continue;
-                                                    };
+                                                            if let Some(account_info) = account_update.account {
+                                                                let Ok(account_pubkey) =
+                                                                    Pubkey::try_from(account_info.pubkey)
+                                                                else {
+                                                                    continue;
+                                                                };
 
-                                                    let Ok(account_owner_pubkey) =
-                                                        Pubkey::try_from(account_info.owner)
-                                                    else {
-                                                        continue;
-                                                    };
+                                                                let Ok(account_owner_pubkey) =
+                                                                    Pubkey::try_from(account_info.owner)
+                                                                else {
+                                                                    continue;
+                                                                };
 
-                                                    let account = Account {
-                                                        lamports: account_info.lamports,
-                                                        data: account_info.data,
-                                                        owner: account_owner_pubkey,
-                                                        executable: account_info.executable,
-                                                        rent_epoch: account_info.rent_epoch,
-                                                    };
+                                                                let account = Account {
+                                                                    lamports: account_info.lamports,
+                                                                    data: account_info.data,
+                                                                    owner: account_owner_pubkey,
+                                                                    executable: account_info.executable,
+                                                                    rent_epoch: account_info.rent_epoch,
+                                                                };
 
-                                                    if account.lamports == 0
-                                                        && account.data.is_empty()
-                                                        && account_owner_pubkey
-                                                            == solana_sdk::system_program::ID
-                                                    {
-                                                        let accounts =
-                                                            account_deletions_tracked.read().await;
-                                                        if accounts.contains(&account_pubkey) {
-                                                            let account_deletion = AccountDeletion {
-                                                                pubkey: account_pubkey,
-                                                                slot: account_update.slot,
-                                                            };
-                                                            if let Err(e) = sender.send(
-                                                                Update::AccountDeletion(account_deletion),
-                                                            ) {
-                                                                log::error!("Failed to send account deletion update for pubkey {:?} at slot {}: {:?}", account_pubkey, account_update.slot, e);
+                                                                if account.lamports == 0
+                                                                    && account.data.is_empty()
+                                                                    && account_owner_pubkey
+                                                                        == solana_program::system_program::ID
+                                                                {
+                                                                    let accounts =
+                                                                        account_deletions_tracked.read().await;
+                                                                    if accounts.contains(&account_pubkey) {
+                                                                        let account_deletion = AccountDeletion {
+                                                                            pubkey: account_pubkey,
+                                                                            slot: account_update.slot,
+                                                                        };
+                                                                        if let Err(e) = sender.try_send(
+                                                                            Update::AccountDeletion(account_deletion),
+                                                                        ) {
+                                                                            log::error!("Failed to send account deletion update for pubkey {:?} at slot {}: {:?}", account_pubkey, account_update.slot, e);
+                                                                        }
+                                                                    }
+                                                                } else {
+                                                                    let update = Update::Account(AccountUpdate {
+                                                                        pubkey: account_pubkey,
+                                                                        account,
+                                                                        slot: account_update.slot,
+                                                                    });
+
+                                                                    if let Err(e) = sender.try_send(update) {
+                                                                        log::error!("Failed to send account update for pubkey {:?} at slot {}: {:?}", account_pubkey, account_update.slot, e);
+                                                                    }
+                                                                }
+
+                                                                metrics
+                                                                        .record_histogram(
+                                                                            "yellowstone_grpc_account_process_time_nanoseconds",
+                                                                            start_time.elapsed().as_nanos() as f64
+                                                                        )
+                                                                        .await
+                                                                        .unwrap();
+
+                                                                metrics.increment_counter("yellowstone_grpc_account_updates_received", 1).await.unwrap_or_else(|value| log::error!("Error recording metric: {}", value));
+
+                                                            } else {
+                                                                log::error!("No account info in UpdateOneof::Account at slot {}", account_update.slot);
                                                             }
                                                         }
-                                                    } else {
-                                                        let update = Update::Account(AccountUpdate {
-                                                            pubkey: account_pubkey,
-                                                            account,
-                                                            slot: account_update.slot,
-                                                        });
 
-                                                        if let Err(e) = sender.send(update) {
-                                                            log::error!("Failed to send account update for pubkey {:?} at slot {}: {:?}", account_pubkey, account_update.slot, e);
+                                                        Some(UpdateOneof::Transaction(transaction_update)) => {
+                                                            let start_time = std::time::Instant::now();
+
+                                                            if let Some(transaction_info) =
+                                                                transaction_update.transaction
+                                                            {
+                                                                let Ok(signature) =
+                                                                    Signature::try_from(transaction_info.signature)
+                                                                else {
+                                                                    continue;
+                                                                };
+                                                                let Some(yellowstone_transaction) =
+                                                                    transaction_info.transaction
+                                                                else {
+                                                                    continue;
+                                                                };
+                                                                let Some(yellowstone_tx_meta) = transaction_info.meta
+                                                                else {
+                                                                    continue;
+                                                                };
+                                                                let Ok(versioned_transaction) =
+                                                                    create_tx_versioned(yellowstone_transaction)
+                                                                else {
+                                                                    continue;
+                                                                };
+                                                                let meta_original = match create_tx_meta(
+                                                                    yellowstone_tx_meta,
+                                                                ) {
+                                                                    Ok(meta) => meta,
+                                                                    Err(err) => {
+                                                                        log::error!(
+                                                                            "Failed to create transaction meta: {:?}",
+                                                                            err
+                                                                        );
+                                                                        continue;
+                                                                    }
+                                                                };
+                                                                let update = Update::Transaction(Box::new(TransactionUpdate {
+                                                                    signature,
+                                                                    transaction: versioned_transaction,
+                                                                    meta: meta_original,
+                                                                    is_vote: transaction_info.is_vote,
+                                                                    slot: transaction_update.slot,
+                                                                    block_time: None,
+                                                                }));
+                                                                if let Err(e) = sender.try_send(update) {
+                                                                    log::error!("Failed to send transaction update with signature {:?} at slot {}: {:?}", signature, transaction_update.slot, e);
+                                                                    continue;
+                                                                }
+                                                            } else {
+                                                                log::error!("No transaction info in `UpdateOneof::Transaction` at slot {}", transaction_update.slot);
+                                                            }
+
+                                                            metrics
+                                                                    .record_histogram(
+                                                                        "yellowstone_grpc_transaction_process_time_nanoseconds",
+                                                                        start_time.elapsed().as_nanos() as f64
+                                                                    )
+                                                                    .await
+                                                                    .unwrap();
+
+                                                            metrics.increment_counter("yellowstone_grpc_transaction_updates_received", 1).await.unwrap_or_else(|value| log::error!("Error recording metric: {}", value));
+
                                                         }
+
+                                                        Some(UpdateOneof::Ping(_)) => {
+                                                            _ = subscribe_tx
+                                                                .send(SubscribeRequest {
+                                                                    ping: Some(SubscribeRequestPing { id: 1 }),
+                                                                    ..Default::default()
+                                                                })
+                                                                .await
+                                                        }
+
+                                                        _ => {}
                                                     }
-
-                                                    metrics
-                                                            .record_histogram(
-                                                                "yellowstone_grpc_account_process_time_nanoseconds",
-                                                                start_time.elapsed().as_nanos() as f64
-                                                            )
-                                                            .await
-                                                            .unwrap();
-
-                                                    metrics.increment_counter("yellowstone_grpc_account_updates_received", 1).await.unwrap_or_else(|value| log::error!("Error recording metric: {}", value));
-
-                                                } else {
-                                                    log::error!("No account info in UpdateOneof::Account at slot {}", account_update.slot);
+                                                },
+                                                Some(Err(error)) => {
+                                                    log::error!("Geyser processor error: {error:?}");
+                                                    ping_stream_active = false;
+                                                },
+                                                None => {
+                                                    log::info!("Geyser stream ended");
+                                                    ping_stream_active = false;
                                                 }
                                             }
-
-                                            Some(UpdateOneof::Transaction(transaction_update)) => {
-                                                let start_time = std::time::Instant::now();
-
-                                                if let Some(transaction_info) =
-                                                    transaction_update.transaction
-                                                {
-                                                    let Ok(signature) =
-                                                        Signature::try_from(transaction_info.signature)
-                                                    else {
-                                                        continue;
-                                                    };
-                                                    let Some(yellowstone_transaction) =
-                                                        transaction_info.transaction
-                                                    else {
-                                                        continue;
-                                                    };
-                                                    let Some(yellowstone_tx_meta) = transaction_info.meta
-                                                    else {
-                                                        continue;
-                                                    };
-                                                    let Ok(versioned_transaction) =
-                                                        create_tx_versioned(yellowstone_transaction)
-                                                    else {
-                                                        continue;
-                                                    };
-                                                    let meta_original = match create_tx_meta(
-                                                        yellowstone_tx_meta,
-                                                    ) {
-                                                        Ok(meta) => meta,
-                                                        Err(err) => {
-                                                            log::error!(
-                                                                "Failed to create transaction meta: {:?}",
-                                                                err
-                                                            );
-                                                            continue;
-                                                        }
-                                                    };
-                                                    let update = Update::Transaction(Box::new(TransactionUpdate {
-                                                        signature,
-                                                        transaction: versioned_transaction,
-                                                        meta: meta_original,
-                                                        is_vote: transaction_info.is_vote,
-                                                        slot: transaction_update.slot,
-                                                        block_time: None,
-                                                    }));
-                                                    if let Err(e) = sender.send(update) {
-                                                        log::error!("Failed to send transaction update with signature {:?} at slot {}: {:?}", signature, transaction_update.slot, e);
-                                                        continue;
-                                                    }
-                                                } else {
-                                                    log::error!("No transaction info in `UpdateOneof::Transaction` at slot {}", transaction_update.slot);
-                                                }
-
-                                                metrics
-                                                        .record_histogram(
-                                                            "yellowstone_grpc_transaction_process_time_nanoseconds",
-                                                            start_time.elapsed().as_nanos() as f64
-                                                        )
-                                                        .await
-                                                        .unwrap();
-
-                                                metrics.increment_counter("yellowstone_grpc_transaction_updates_received", 1).await.unwrap_or_else(|value| log::error!("Error recording metric: {}", value));
-
-                                            }
-
-                                            Some(UpdateOneof::Ping(_)) => {
-                                                _ = subscribe_tx
-                                                    .send(SubscribeRequest {
-                                                        ping: Some(SubscribeRequestPing { id: 1 }),
-                                                        ..Default::default()
-                                                    })
-                                                    .await
-                                            }
-
-                                            _ => {}
                                         },
-                                        Err(error) => {
-                                            log::error!("Geyser stream error: {error:?}");
-                                            break;
+                                        Some(_) = ping_receiver.recv() => {
+                                            if let Err(e) = subscribe_tx
+                                                .send(SubscribeRequest {
+                                                    ping: Some(SubscribeRequestPing { id: 1 }),
+                                                    ..Default::default()
+                                                })
+                                                .await
+                                            {
+                                                log::error!("Failed to send periodic ping request: {:?}", e);
+                                                ping_stream_active = false;
+                                            }
+                                        },
+                                        else => {
+                                            log::error!("ping channel closed");
+                                            ping_stream_active = false;
                                         }
                                     }
                                 }
+
+                                ping_handle.abort();
                             }
                             Err(e) => {
                                 log::error!("Failed to subscribe: {:?}", e);
