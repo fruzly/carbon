@@ -115,7 +115,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                 let (ping_sender, mut ping_receiver) = tokio::sync::mpsc::channel(10);
 
                                 let ping_handle = tokio::spawn(async move {
-                                    let mut interval = tokio::time::interval(Duration::from_secs(30));
+                                    let mut interval = tokio::time::interval(Duration::from_secs(300));
                                     loop {
                                         interval.tick().await;
                                         if let Err(e) = ping_sender.send(()).await {
