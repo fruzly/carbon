@@ -15,7 +15,6 @@ use {
         sync::Arc,
         time::Duration,
     },
-    tokio::time::{interval, Duration as AsyncDuration},
     tokio::sync::{mpsc::UnboundedSender, RwLock},
     tokio_util::sync::CancellationToken,
     yellowstone_grpc_client::GeyserGrpcClient,
@@ -136,22 +135,22 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                     match msg.update_oneof {
                                                         Some(UpdateOneof::Account(account_update)) => {
                                                             let start_time = std::time::Instant::now();
-
+            
                                                             metrics.increment_counter("yellowstone_grpc_account_updates_received", 1).await.unwrap();
-
+            
                                                             if let Some(account_info) = account_update.account {
                                                                 let Ok(account_pubkey) =
                                                                     Pubkey::try_from(account_info.pubkey)
                                                                 else {
                                                                     continue;
                                                                 };
-
+            
                                                                 let Ok(account_owner_pubkey) =
                                                                     Pubkey::try_from(account_info.owner)
                                                                 else {
                                                                     continue;
                                                                 };
-
+            
                                                                 let account = Account {
                                                                     lamports: account_info.lamports,
                                                                     data: account_info.data,
@@ -159,11 +158,11 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                                     executable: account_info.executable,
                                                                     rent_epoch: account_info.rent_epoch,
                                                                 };
-
+            
                                                                 if account.lamports == 0
                                                                     && account.data.is_empty()
                                                                     && account_owner_pubkey
-                                                                        == solana_program::system_program::ID
+                                                                        == solana_sdk::system_program::ID
                                                                 {
                                                                     let accounts =
                                                                         account_deletions_tracked.read().await;
@@ -172,7 +171,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                                             pubkey: account_pubkey,
                                                                             slot: account_update.slot,
                                                                         };
-                                                                        if let Err(e) = sender.try_send(
+                                                                        if let Err(e) = sender.send(
                                                                             Update::AccountDeletion(account_deletion),
                                                                         ) {
                                                                             log::error!("Failed to send account deletion update for pubkey {:?} at slot {}: {:?}", account_pubkey, account_update.slot, e);
@@ -184,12 +183,12 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                                         account,
                                                                         slot: account_update.slot,
                                                                     });
-
-                                                                    if let Err(e) = sender.try_send(update) {
+            
+                                                                    if let Err(e) = sender.send(update) {
                                                                         log::error!("Failed to send account update for pubkey {:?} at slot {}: {:?}", account_pubkey, account_update.slot, e);
                                                                     }
                                                                 }
-
+            
                                                                 metrics
                                                                         .record_histogram(
                                                                             "yellowstone_grpc_account_process_time_nanoseconds",
@@ -197,17 +196,17 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                                         )
                                                                         .await
                                                                         .unwrap();
-
+            
                                                                 metrics.increment_counter("yellowstone_grpc_account_updates_received", 1).await.unwrap_or_else(|value| log::error!("Error recording metric: {}", value));
-
+            
                                                             } else {
                                                                 log::error!("No account info in UpdateOneof::Account at slot {}", account_update.slot);
                                                             }
                                                         }
-
+            
                                                         Some(UpdateOneof::Transaction(transaction_update)) => {
                                                             let start_time = std::time::Instant::now();
-
+            
                                                             if let Some(transaction_info) =
                                                                 transaction_update.transaction
                                                             {
@@ -250,14 +249,14 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                                     slot: transaction_update.slot,
                                                                     block_time: None,
                                                                 }));
-                                                                if let Err(e) = sender.try_send(update) {
+                                                                if let Err(e) = sender.send(update) {
                                                                     log::error!("Failed to send transaction update with signature {:?} at slot {}: {:?}", signature, transaction_update.slot, e);
                                                                     continue;
                                                                 }
                                                             } else {
                                                                 log::error!("No transaction info in `UpdateOneof::Transaction` at slot {}", transaction_update.slot);
                                                             }
-
+            
                                                             metrics
                                                                     .record_histogram(
                                                                         "yellowstone_grpc_transaction_process_time_nanoseconds",
@@ -265,11 +264,11 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                                     )
                                                                     .await
                                                                     .unwrap();
-
+            
                                                             metrics.increment_counter("yellowstone_grpc_transaction_updates_received", 1).await.unwrap_or_else(|value| log::error!("Error recording metric: {}", value));
-
+            
                                                         }
-
+            
                                                         Some(UpdateOneof::Ping(_)) => {
                                                             _ = subscribe_tx
                                                                 .send(SubscribeRequest {
